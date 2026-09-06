@@ -1,6 +1,6 @@
 # TripMate
 
-🔗 **Try it now (no setup needed):** [PASTE YOUR PUBLIC STREAMLIT URL HERE]
+🔗 **Try it now (no setup needed):** https://tripmateagent.streamlit.app/
 
 Want to look at, modify, or run the code yourself instead? Clone the repo and set it up locally — see **Setup** and **Running it** below.
 
