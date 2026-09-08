@@ -50,28 +50,18 @@ def check_destination(destination_name: str, max_retries: int = 3):
     same free geocoding service agent.py's first tool call uses) BEFORE
     spending an expensive multi-round agent run on a typo.
 
-    Deliberately separate from the agent's own tool-calling loop — this is
-    input validation, not planning, and it never touches OpenAI/SerpApi/ORS.
-
-    WHY THREE OUTCOMES INSTEAD OF TRUE/FALSE: an earlier version of this
-    function failed OPEN on persistent 429s — if Nominatim stayed
-    rate-limited through every retry, it just let the destination through
-    unverified. In practice this meant testing two destinations back to
-    back could exhaust the retry budget on the second one and silently
-    wave real gibberish (e.g. "ghhghh") straight into a full agent run,
-    defeating the entire point of validating first. Now a persistent 429
-    is reported as "unknown" rather than silently treated as "valid", so
-    the caller can tell the user to wait a moment instead of either
-    blocking forever OR quietly letting garbage through.
-
     Returns:
-        "valid"   — Nominatim found a real match.
-        "invalid" — Nominatim reached us fine and found nothing.
-        "unknown" — couldn't get a real answer (rate-limited on every
-                    retry, or a network/timeout issue). The caller should
-                    ask the user to wait and try again, NOT proceed as if
-                    it were valid.
+        (status, detail) where status is one of:
+            "valid"   — Nominatim found a real match.
+            "invalid" — Nominatim reached us fine and found nothing.
+            "unknown" — couldn't get a real answer after retrying.
+        detail is None for "valid"/"invalid", or a short diagnostic
+        string for "unknown" — the ACTUAL exception type/status code/
+        message from the last failed attempt, so a persistent failure
+        can be diagnosed from real evidence instead of guessed at.
     """
+    last_detail = None
+
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.get(
@@ -81,20 +71,24 @@ def check_destination(destination_name: str, max_retries: int = 3):
                 timeout=8,
             )
             response.raise_for_status()
-            return "valid" if response.json() else "invalid"
+            return ("valid" if response.json() else "invalid"), None
         except requests.exceptions.HTTPError as e:
-            is_rate_limited = e.response is not None and e.response.status_code == 429
+            status_code = e.response.status_code if e.response is not None else "no response"
+            response_snippet = (e.response.text[:200] if e.response is not None else "")
+            last_detail = f"Attempt {attempt}/{max_retries}: HTTP {status_code} — {e}\nBody: {response_snippet}"
+            is_rate_limited = status_code == 429
             if is_rate_limited and attempt < max_retries:
                 time.sleep(attempt)
                 continue
-            return "unknown"
-        except requests.exceptions.RequestException:
+            return "unknown", last_detail
+        except requests.exceptions.RequestException as e:
+            last_detail = f"Attempt {attempt}/{max_retries}: {type(e).__name__} — {e}"
             if attempt < max_retries:
                 time.sleep(attempt)
                 continue
-            return "unknown"
+            return "unknown", last_detail
 
-    return "unknown"
+    return "unknown", last_detail
 
 
 def pick_emoji_for_category(category_text: str) -> str:
@@ -241,7 +235,7 @@ if generate_button_clicked:
     # instead of a ~15-second wait followed by a raw HTTPError traceback.
     # -------------------------------------------------------------------
     with st.spinner("Checking destination..."):
-        validation_result = check_destination(destination_name)
+        validation_result, validation_detail = check_destination(destination_name)
 
     if validation_result == "invalid":
         st.error(
@@ -251,9 +245,11 @@ if generate_button_clicked:
         st.stop()
     elif validation_result == "unknown":
         st.warning(
-            "⏳ The geocoding service is temporarily rate-limited and we couldn't verify "
-            f"**\"{destination_name}\"** just now. Please wait a few seconds and click Generate again."
+            f"⏳ Couldn't verify **\"{destination_name}\"** right now — the geocoding check failed. "
+            "See the technical details below for the actual cause."
         )
+        with st.expander("Technical details (for debugging)", expanded=True):
+            st.code(validation_detail or "No detail captured.")
         st.stop()
     # validation_result == "valid" -> fall through and proceed
 
