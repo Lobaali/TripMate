@@ -27,6 +27,7 @@ agent run, so a typo like "asdlkfj" fails in under a second with a
 friendly message instead of ~15 seconds later with a raw Python traceback.
 """
 
+import time
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -43,7 +44,7 @@ load_dotenv()
 st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="centered")
 
 
-def destination_looks_valid(destination_name: str) -> bool:
+def destination_looks_valid(destination_name: str, max_retries: int = 2) -> bool:
     """
     Quick pre-check: confirms the destination resolves to a real place via
     Nominatim (the same free geocoding service agent.py's first tool call
@@ -52,23 +53,37 @@ def destination_looks_valid(destination_name: str) -> bool:
     Deliberately separate from the agent's own tool-calling loop — this is
     input validation, not planning, and it never touches OpenAI/SerpApi/ORS.
 
+    WHY THE RETRY LOOP: Nominatim rate-limits to ~1 request/second, and
+    Streamlit Cloud apps share outbound IPs — a 429 here doesn't
+    necessarily mean anything is wrong, just that the shared IP is
+    momentarily over the limit. One short retry resolves most of these.
+
     Returns:
         True if the destination looks real, or if the geocoding service
-        itself couldn't be reached (fails open — better to let the agent's
-        own call surface a real problem than to block someone over a
-        flaky network blip here).
+        couldn't be reached even after retrying (fails open — better to
+        let the agent's own call surface a real problem than to block
+        someone here over a persistent-but-unrelated outage).
     """
-    try:
-        response = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": destination_name, "format": "json", "limit": 1},
-            headers={"User-Agent": "TripMate-Validator/1.0"},
-            timeout=8,
-        )
-        response.raise_for_status()
-        return bool(response.json())  # empty list = Nominatim found nothing real
-    except requests.exceptions.RequestException:
-        return True
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": destination_name, "format": "json", "limit": 1},
+                headers={"User-Agent": "TripMate-Validator/1.0"},
+                timeout=8,
+            )
+            response.raise_for_status()
+            return bool(response.json())  # empty list = Nominatim found nothing real
+        except requests.exceptions.HTTPError as e:
+            is_rate_limited = e.response is not None and e.response.status_code == 429
+            if is_rate_limited and attempt < max_retries:
+                time.sleep(attempt)
+                continue
+            return True  # fail open — don't block the user over a rate limit
+        except requests.exceptions.RequestException:
+            return True
+
+    return True
 
 
 def pick_emoji_for_category(category_text: str) -> str:
@@ -223,6 +238,13 @@ if generate_button_clicked:
             "Check the spelling, or try a broader name (e.g. 'Porto' instead of a specific street)."
         )
         st.stop()
+
+    # Nominatim allows ~1 request/second. The pre-check above JUST hit it,
+    # and the agent's own first tool call is about to hit it again — this
+    # short pause keeps the two calls from landing in the same second and
+    # triggering a self-inflicted 429 (this was happening in practice on
+    # Streamlit Cloud, where outbound IPs are shared across many apps).
+    time.sleep(1)
 
     # st.status(...) creates an expandable progress box in the UI. We keep
     # it open (expanded=True) for the whole run so the user can watch each

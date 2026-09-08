@@ -4,72 +4,90 @@ tools.py — The three real-world API calls the agent can use as "tools".
 WHAT THIS FILE IS: plain Python functions that hit real APIs and return
 plain Python data (tuples, lists, dicts). 
 
-
 THE THREE FUNCTIONS, IN THE ORDER THE AGENT TYPICALLY CALLS THEM:
   1. geocode_destination()        -> turn a place name into coordinates
   2. search_points_of_interest()  -> find candidate places near those coordinates
   3. get_walking_time_matrix()    -> get real walking times between chosen places
-
 """
 
 import os
+import time
 import requests
 from dotenv import load_dotenv
 
-# load_dotenv() reads your local .env file and copies its key=value lines
-# into the process's environment variables. 
 load_dotenv()
 
 SERPAPI_KEY = os.environ["SERPAPI_KEY"]  # https://serpapi.com/manage-api-key (free tier: 100 searches/month)
 ORS_KEY = os.environ["ORS_KEY"]          # https://openrouteservice.org/dev/#/signup (free tier: 2000 req/day)
 
 
-def geocode_destination(destination_name: str):
+def geocode_destination(destination_name: str, max_retries: int = 3):
     """
     Turn a place name like 'Lisbon, Portugal' into (latitude, longitude).
 
     WHY NOMINATIM: it's OpenStreetMap's free geocoding service — no API key
-    needed at all, no signup, no rate-limit headaches for a hobby project.
-    This is deliberately the simplest possible tool in the whole pipeline.
+    needed at all. The tradeoff is a strict rate limit (~1 request/second)
+    and, since apps hosted on Streamlit Cloud share outbound IPs across
+    many unrelated apps, it's easy to get a 429 "Too many requests" even
+    if THIS app is behaving well — someone else's app sharing the same IP
+    might be hammering Nominatim at the same moment.
 
-    HOW IT'S USED BY THE AGENT: this is always the first tool called,
-    because both of the other two tools need real coordinates to work from
-    — you can't search "near Lisbon" or compute distances without first
-    knowing where Lisbon actually is on the map.
+    WHY THE RETRY LOOP: a single 429 is usually transient, not a sign
+    anything is actually broken. Retrying with a short, increasing delay
+    (1s, then 2s) resolves the large majority of these without the user
+    ever seeing an error. If all retries are exhausted, the 429 is raised
+    normally so app.py's error handling can show a friendly message.
 
     Args:
         destination_name: free text like "Lisbon, Portugal" or just "Lisbon"
+        max_retries: how many total attempts to make before giving up
 
     Returns:
         A tuple (latitude, longitude), both as plain Python floats.
+
+    Raises:
+        ValueError if Nominatim genuinely found nothing for this name.
+        requests.exceptions.HTTPError if every retry still gets rate-limited
+        (or another HTTP error) after max_retries attempts.
     """
-    response = requests.get(
-        "https://nominatim.openstreetmap.org/search",
-        params={
-            "q": destination_name,   # the search text itself
-            "format": "json",        # ask for JSON back instead of XML
-            "limit": 1,               # we only need the single best match
-        },
-        # Nominatim's usage policy requires a descriptive User-Agent header
-        # identifying the calling application — requests without one can be
-        # silently rejected or rate-limited more aggressively.
-        headers={"User-Agent": "TripMate/1.0"},
-        timeout=10,  # give up after 10 seconds rather than hanging forever
-    )
-    response.raise_for_status()  # turns HTTP error codes (4xx/5xx) into a Python exception
+    last_error = None
 
-    results = response.json()
-    if not results:
-        # An empty list means Nominatim genuinely found nothing — this is
-        # different from an HTTP error, so we raise our own clear exception
-        # rather than letting a confusing IndexError happen below.
-        raise ValueError(f"Could not geocode '{destination_name}' — check the spelling or try a broader name.")
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": destination_name, "format": "json", "limit": 1},
+                headers={"User-Agent": "TripMate/1.0"},
+                timeout=10,
+            )
+            response.raise_for_status()
 
-    # Nominatim returns results ordered by relevance, so index [0] is its
-    # single best guess. Coordinates come back as strings, so we cast to float.
-    latitude = float(results[0]["lat"])
-    longitude = float(results[0]["lon"])
-    return latitude, longitude
+            results = response.json()
+            if not results:
+                # Genuinely no match — retrying won't help, fail immediately
+                # with a clear message instead of burning retries on it.
+                raise ValueError(f"Could not geocode '{destination_name}' — check the spelling or try a broader name.")
+
+            latitude = float(results[0]["lat"])
+            longitude = float(results[0]["lon"])
+            return latitude, longitude
+
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            is_rate_limited = e.response is not None and e.response.status_code == 429
+            if is_rate_limited and attempt < max_retries:
+                # Backoff: wait a bit longer each retry (1s, 2s, ...) rather
+                # than hammering Nominatim again immediately, which would
+                # just trigger the same 429 right back.
+                time.sleep(attempt)
+                continue
+            raise  # not a 429, or we're out of retries — surface it for real
+
+    # Should be unreachable (the loop always returns or raises), but keeps
+    # the function's control flow explicit rather than implicitly falling
+    # through to `None`.
+    raise last_error
+
 
 
 def search_points_of_interest(latitude: float, longitude: float, interests_text: str = "", max_results: int = 30):
