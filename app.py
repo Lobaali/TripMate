@@ -13,13 +13,21 @@ project, app.py called tools.py's three functions directly, in a fixed
 order, and only used the LLM at the very end to do the day-by-day
 reasoning. That was a deterministic pipeline with an LLM step bolted onto
 the end of it — NOT a tool-calling agent. Now, app.py doesn't call
-tools.py at all. It only imports and calls run_trip_planning_agent(), and
-the model itself decides when (and whether) each underlying tool gets
-used. The on_tool_call callback below exists purely so this file can still
-show live progress in the UI even though it no longer controls the order
-those tool calls happen in.
+tools.py at all for actual planning. It only imports and calls
+run_trip_planning_agent(), and the model itself decides when (and whether)
+each underlying tool gets used. The on_tool_call callback below exists
+purely so this file can still show live progress in the UI even though it
+no longer controls the order those tool calls happen in.
+
+ONE EXCEPTION to "app.py doesn't touch tools.py": destination_looks_valid()
+below makes its own quick, direct call to the same free geocoding service
+the agent's first tool uses. This is NOT planning logic — it's a cheap
+sanity check run before the button click is allowed to start an expensive
+agent run, so a typo like "asdlkfj" fails in under a second with a
+friendly message instead of ~15 seconds later with a raw Python traceback.
 """
 
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -33,6 +41,34 @@ from agent import run_trip_planning_agent
 load_dotenv()
 
 st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="centered")
+
+
+def destination_looks_valid(destination_name: str) -> bool:
+    """
+    Quick pre-check: confirms the destination resolves to a real place via
+    Nominatim (the same free geocoding service agent.py's first tool call
+    uses) BEFORE spending an expensive multi-round agent run on a typo.
+
+    Deliberately separate from the agent's own tool-calling loop — this is
+    input validation, not planning, and it never touches OpenAI/SerpApi/ORS.
+
+    Returns:
+        True if the destination looks real, or if the geocoding service
+        itself couldn't be reached (fails open — better to let the agent's
+        own call surface a real problem than to block someone over a
+        flaky network blip here).
+    """
+    try:
+        response = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": destination_name, "format": "json", "limit": 1},
+            headers={"User-Agent": "TripMate-Validator/1.0"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        return bool(response.json())  # empty list = Nominatim found nothing real
+    except requests.exceptions.RequestException:
+        return True
 
 
 def pick_emoji_for_category(category_text: str) -> str:
@@ -87,12 +123,6 @@ st.title("🗺️ TripMate")
 st.caption("Tell me where and how long — I'll build a real, walkable day-by-day plan around what you actually like.")
 
 # ---------------------------------------------------------------------------
-# Sidebar: collect every piece of input the agent needs before it starts.
-# None of these values are validated or transformed here — they're passed
-# straight through to run_trip_planning_agent() exactly as the widgets
-# produce them.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # A curated list of popular destinations for the dropdown. This is just a
 # starting point for convenience — "Other (type my own)" falls through to
 # a free-text box, so the destination is never actually LIMITED to this
@@ -129,10 +159,9 @@ INTEREST_OPTIONS = [
 
 # ---------------------------------------------------------------------------
 # Sidebar: collect every piece of input the agent needs before it starts.
-# None of these values are validated or transformed here (aside from
-# joining the checkbox selections into a single string) — they're passed
-# straight through to run_trip_planning_agent() exactly as the widgets
-# produce them.
+# None of these values are validated here except the checkbox-join —
+# destination validity is checked separately, right after the button click,
+# so the sidebar itself stays fast and simple.
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.header("✈️ Trip details")
@@ -168,6 +197,8 @@ with st.sidebar:
 
     # Guard against generating with no destination or no interests picked,
     # since both would otherwise silently produce a broken or generic trip.
+    # (Destination REALNESS — as opposed to just non-empty — is checked
+    # after the click, so we don't hit Nominatim on every keystroke.)
     can_generate = bool(destination_name.strip()) and bool(checked_interests)
     if not can_generate:
         st.caption("⚠️ Pick a destination and at least one interest to continue.")
@@ -177,6 +208,21 @@ with st.sidebar:
 
 
 if generate_button_clicked:
+
+    # -------------------------------------------------------------------
+    # STEP 0: validate the destination BEFORE spending an agent run on it.
+    # This is what turns "ri" or "asdlkfj" into an instant, friendly error
+    # instead of a ~15-second wait followed by a raw HTTPError traceback.
+    # -------------------------------------------------------------------
+    with st.spinner("Checking destination..."):
+        destination_is_valid = destination_looks_valid(destination_name)
+
+    if not destination_is_valid:
+        st.error(
+            f"⚠️ Couldn't find **\"{destination_name}\"** as a real place. "
+            "Check the spelling, or try a broader name (e.g. 'Porto' instead of a specific street)."
+        )
+        st.stop()
 
     # st.status(...) creates an expandable progress box in the UI. We keep
     # it open (expanded=True) for the whole run so the user can watch each
@@ -196,21 +242,35 @@ if generate_button_clicked:
             friendly_label = TOOL_NAME_TO_FRIENDLY_LABEL.get(tool_name, f"Calling {tool_name}...")
             st.write(friendly_label)
 
-        # THIS is the entire hand-off to the agent. Everything from here
-        # to the returned itinerary happens inside agent.py — the full
-        # tool-calling loop (Phase 1) and the structured-output conversion
-        # (Phase 2) both run inside this one function call.
-        itinerary = run_trip_planning_agent(
-            destination_name,
-            number_of_days,
-            interests_text,
-            pace,
-            total_budget_usd=total_budget_usd if total_budget_usd > 0 else None,
-            number_of_people=number_of_people,
-            on_tool_call=show_tool_call_progress,
-        )
-
-        status.update(label="✅ Your trip is ready!", state="complete")
+        # -----------------------------------------------------------
+        # STEP 1: hand off to the agent. Wrapped in try/except as a
+        # SECOND line of defense — the pre-check above catches most bad
+        # destinations, but this catches anything else that can still go
+        # wrong deeper in the loop (a flaky API, a search that comes back
+        # empty, the model exceeding MAX_TOOL_CALL_ROUNDS, etc.) and shows
+        # a plain-English message instead of a raw traceback either way.
+        # -----------------------------------------------------------
+        try:
+            itinerary = run_trip_planning_agent(
+                destination_name,
+                number_of_days,
+                interests_text,
+                pace,
+                total_budget_usd=total_budget_usd if total_budget_usd > 0 else None,
+                number_of_people=number_of_people,
+                on_tool_call=show_tool_call_progress,
+            )
+            status.update(label="✅ Your trip is ready!", state="complete")
+        except Exception as e:
+            status.update(label="❌ Something went wrong", state="error")
+            st.error(
+                "The agent ran into a problem while planning this trip. "
+                "This can happen with very obscure destinations or a temporary API hiccup — try again, "
+                "or try a nearby larger city."
+            )
+            with st.expander("Technical details (for debugging)"):
+                st.code(str(e))
+            st.stop()
 
     # -------------------------------------------------------------------
     # Display the result. Because agent.py guarantees itinerary matches
