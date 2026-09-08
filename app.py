@@ -44,25 +44,33 @@ load_dotenv()
 st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="centered")
 
 
-def destination_looks_valid(destination_name: str, max_retries: int = 2) -> bool:
+def check_destination(destination_name: str, max_retries: int = 3):
     """
-    Quick pre-check: confirms the destination resolves to a real place via
-    Nominatim (the same free geocoding service agent.py's first tool call
-    uses) BEFORE spending an expensive multi-round agent run on a typo.
+    Confirms the destination resolves to a real place via Nominatim (the
+    same free geocoding service agent.py's first tool call uses) BEFORE
+    spending an expensive multi-round agent run on a typo.
 
     Deliberately separate from the agent's own tool-calling loop — this is
     input validation, not planning, and it never touches OpenAI/SerpApi/ORS.
 
-    WHY THE RETRY LOOP: Nominatim rate-limits to ~1 request/second, and
-    Streamlit Cloud apps share outbound IPs — a 429 here doesn't
-    necessarily mean anything is wrong, just that the shared IP is
-    momentarily over the limit. One short retry resolves most of these.
+    WHY THREE OUTCOMES INSTEAD OF TRUE/FALSE: an earlier version of this
+    function failed OPEN on persistent 429s — if Nominatim stayed
+    rate-limited through every retry, it just let the destination through
+    unverified. In practice this meant testing two destinations back to
+    back could exhaust the retry budget on the second one and silently
+    wave real gibberish (e.g. "ghhghh") straight into a full agent run,
+    defeating the entire point of validating first. Now a persistent 429
+    is reported as "unknown" rather than silently treated as "valid", so
+    the caller can tell the user to wait a moment instead of either
+    blocking forever OR quietly letting garbage through.
 
     Returns:
-        True if the destination looks real, or if the geocoding service
-        couldn't be reached even after retrying (fails open — better to
-        let the agent's own call surface a real problem than to block
-        someone here over a persistent-but-unrelated outage).
+        "valid"   — Nominatim found a real match.
+        "invalid" — Nominatim reached us fine and found nothing.
+        "unknown" — couldn't get a real answer (rate-limited on every
+                    retry, or a network/timeout issue). The caller should
+                    ask the user to wait and try again, NOT proceed as if
+                    it were valid.
     """
     for attempt in range(1, max_retries + 1):
         try:
@@ -73,17 +81,20 @@ def destination_looks_valid(destination_name: str, max_retries: int = 2) -> bool
                 timeout=8,
             )
             response.raise_for_status()
-            return bool(response.json())  # empty list = Nominatim found nothing real
+            return "valid" if response.json() else "invalid"
         except requests.exceptions.HTTPError as e:
             is_rate_limited = e.response is not None and e.response.status_code == 429
             if is_rate_limited and attempt < max_retries:
                 time.sleep(attempt)
                 continue
-            return True  # fail open — don't block the user over a rate limit
+            return "unknown"
         except requests.exceptions.RequestException:
-            return True
+            if attempt < max_retries:
+                time.sleep(attempt)
+                continue
+            return "unknown"
 
-    return True
+    return "unknown"
 
 
 def pick_emoji_for_category(category_text: str) -> str:
@@ -230,14 +241,21 @@ if generate_button_clicked:
     # instead of a ~15-second wait followed by a raw HTTPError traceback.
     # -------------------------------------------------------------------
     with st.spinner("Checking destination..."):
-        destination_is_valid = destination_looks_valid(destination_name)
+        validation_result = check_destination(destination_name)
 
-    if not destination_is_valid:
+    if validation_result == "invalid":
         st.error(
             f"⚠️ Couldn't find **\"{destination_name}\"** as a real place. "
             "Check the spelling, or try a broader name (e.g. 'Porto' instead of a specific street)."
         )
         st.stop()
+    elif validation_result == "unknown":
+        st.warning(
+            "⏳ The geocoding service is temporarily rate-limited and we couldn't verify "
+            f"**\"{destination_name}\"** just now. Please wait a few seconds and click Generate again."
+        )
+        st.stop()
+    # validation_result == "valid" -> fall through and proceed
 
     # Nominatim allows ~1 request/second. The pre-check above JUST hit it,
     # and the agent's own first tool call is about to hit it again — this
