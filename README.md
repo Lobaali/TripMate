@@ -17,7 +17,7 @@ PHASE 1 — the tool-calling loop (runs until the model is done reasoning)
 │  You describe the trip → model decides what to do next          │
 │                                                                 │
 │  Model asks to call:  geocode_destination                       │
-│       → Python actually calls geoapify, sends back coordinates │
+│       → Python actually calls geoapify, sends back coordinates  │
 │                                                                 │
 │  Model asks to call:  search_points_of_interest                 │
 │       → Python actually calls SerpApi, sends back real places   │
