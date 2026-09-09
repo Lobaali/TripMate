@@ -1,58 +1,23 @@
 """
-schema.py — Schemas for TripMate
-
-WHAT LIVES IN THIS FILE AND WHY:
-
-LLMs return free-form text by default. That's fine for a chat answer, but
-useless for a program that needs to loop over "days" and "stops" in Python
-and render them as Streamlit tabs. So we force the model's output into an
-exact, predictable shape using JSON Schema either as tool "parameters"
-(so tool calls always have the arguments we expect) or as the final
-structured-output format (so the finished answer always has the fields our
-UI code expects).
+schema.py — Schemas for TripMate, matching the notebook's Responses API style.
 
 TWO KINDS OF SCHEMA LIVE HERE:
-1. TRIP_PLANNING_TOOLS: flat function-tool definitions,
-   TOOLS list: {"type": "function", "name": ..., "parameters":
-   {...}, "strict": True}. 
 
-2. DAY_BY_DAY_ITINERARY_SCHEMA: the raw JSON schema object.
-   response_schema is defined once as a plain schema, then wrapped inline
-   wherever it's passed to the API.
+1. TRIP_PLANNING_TOOLS — flat function-tool definitions: {"type": "function",
+   "name": ..., "parameters": {...}, "strict": True}.
+
+2. DAY_BY_DAY_ITINERARY_SCHEMA — the raw JSON schema for the FINAL answer,
+   used only in agent.py's second (structured-output) call.
 """
 
-# ---------------------------------------------------------------------------
-# TRIP_PLANNING_TOOLS: the functions the agent can choose to call.
-#
-# IMPORTANT: the model decides for itself which of these three tools to
-# call, and in what order, based on the instructions in agent.py's
-# SYSTEM_PROMPT. 
-# ---------------------------------------------------------------------------
 TRIP_PLANNING_TOOLS = [
-
-    # -------------------------------------------------------------------
-    # TOOL 1: geocode_destination
-    #
-    # Purpose: turn a place name into coordinates. This has to run before
-    # the other two tools, since they both need a latitude/longitude to
-    # work from that dependency is explained to the model in the
-    # "description" field below and reinforced in SYSTEM_PROMPT.
-    # -------------------------------------------------------------------
     {
         "type": "function",
-
         "name": "geocode_destination",
-
-        # This description is the ONLY information the model has about what
-        # this tool does and when to use it
         "description": (
             "Turn a destination name (e.g. 'Lisbon, Portugal') into latitude/"
             "longitude coordinates. Call this first, before searching for places."
         ),
-
-        # "parameters" is a JSON Schema describing the arguments the model
-        # must supply when it calls this tool. The model will generate a
-        # JSON object matching this shape as the tool call's "arguments".
         "parameters": {
             "type": "object",
             "properties": {
@@ -64,17 +29,8 @@ TRIP_PLANNING_TOOLS = [
             "required": ["destination_name"],
             "additionalProperties": False
         },
-
         "strict": True
     },
-
-    # -------------------------------------------------------------------
-    # TOOL 2: search_points_of_interest
-    #
-    # Purpose: search Google Maps (via SerpApi under the hood) for real
-    # candidate places near a coordinate, using the traveler's own stated
-    # interests as the literal search terms.
-    # -------------------------------------------------------------------
     {
         "type": "function",
         "name": "search_points_of_interest",
@@ -82,28 +38,21 @@ TRIP_PLANNING_TOOLS = [
             "Search for candidate places near a coordinate, using the traveler's "
             "own interests as the search terms. Call this after geocode_destination, "
             "using the coordinates it returned. Use max_results=30 unless you have "
-            "a specific reason not to."
+            "a specific reason not to. The result tells you, per interest, how many "
+            "places were found — if an interest found ZERO places, that interest is "
+            "simply not available at this destination; do not treat that as an error, "
+            "note it honestly in unmatched_interests_note, and build the itinerary "
+            "around the traveler's other interests plus general highlights instead."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                # These two come from the PREVIOUS tool's result
-                # (geocode_destination's output) the model is expected to
-                # read that result and pass it along here, which is exactly
-                # what "tool calling" means: results from one call feeding
-                # into the next call's arguments, decided by the model.
                 "latitude": {"type": "number"},
                 "longitude": {"type": "number"},
-
                 "interests_text": {
                     "type": "string",
                     "description": "Comma-separated traveler interests, e.g. 'museums, viewpoints, local food'."
                 },
-
-                # We ask the model to explicitly pass this every time (strict
-                # mode requires it to be in "required") rather than relying
-                # on a Python-side default, so the model's choice is always
-                # visible in the tool call itself — easier to debug.
                 "max_results": {
                     "type": "integer",
                     "description": "Maximum number of candidate places to return."
@@ -114,15 +63,6 @@ TRIP_PLANNING_TOOLS = [
         },
         "strict": True
     },
-
-    # -------------------------------------------------------------------
-    # TOOL 3: get_walking_time_matrix
-    #
-    # Purpose: get REAL walking times between a set of places, so the
-    # itinerary is grounded in actual distances instead of the model
-    # guessing "these two museums are probably close together" from their
-    # names alone.
-    # -------------------------------------------------------------------
     {
         "type": "function",
         "name": "get_walking_time_matrix",
@@ -142,11 +82,6 @@ TRIP_PLANNING_TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            # These fields mirror exactly what
-                            # search_points_of_interest returns for each
-                            # place, so the model can copy entries straight
-                            # out of that tool's earlier result into this
-                            # tool's "places" argument without reshaping them.
                             "place_id": {"type": "string"},
                             "name": {"type": "string"},
                             "category": {"type": "string"},
@@ -167,32 +102,11 @@ TRIP_PLANNING_TOOLS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# DAY_BY_DAY_ITINERARY_SCHEMA the raw JSON schema for the FINAL answer.
-#
-# WHEN THIS IS USED: this is NOT sent to the model during the tool-calling
-# loop at all. It's used exactly once, in agent.py's SECOND
-# client.responses.create(...) call — the one that runs AFTER the
-# tool-calling loop has finished and the model has already written its
-# complete plain-text answer. That second call's only job is to reformat
-# the finished text into this exact JSON shape; it has no tools, and no
-# ability to look anything up again. This mirrors your notebook's
-# "Structured Output" step at the end of complete_agent().
-#
-# WHY THIS MATTERS FOR PROMPTING: because this conversion step can't see
-# the raw tool results anymore (only the finished text), agent.py's
-# SYSTEM_PROMPT has to explicitly instruct the model to include every
-# field this schema needs — exact coordinates, costs, walking times, etc.
-# — directly in its plain-text final answer. If a field ever comes back
-# empty or wrong, the first place to look is whether SYSTEM_PROMPT asked
-# for that detail clearly enough.
-# ---------------------------------------------------------------------------
 DAY_BY_DAY_ITINERARY_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
 
-        # --- Trip-level fields: appear ONCE, describing the whole trip ---
         "destination_name": {
             "type": "string",
             "description": "Name of the destination city/region."
@@ -221,7 +135,25 @@ DAY_BY_DAY_ITINERARY_SCHEMA = {
             )
         },
 
-        # --- Day-level fields: one array entry PER DAY of the trip ---
+        # ---------------------------------------------------------------
+        # NEW FIELD: an honest, explicit place for the agent to say
+        # "I looked for X and couldn't find it here" instead of silently
+        # dropping an interest or (worse) inventing fake matches for it.
+        # Empty string is valid and expected when every interest was
+        # matched with real places.
+        # ---------------------------------------------------------------
+        "unmatched_interests_note": {
+            "type": "string",
+            "description": (
+                "If one or more of the traveler's stated interests had ZERO real "
+                "search results at this destination, name which ones here and say "
+                "so plainly (e.g. 'No beaches were found near Riyadh, since it's "
+                "landlocked — the itinerary focuses on your other interests "
+                "instead.'). Leave this as an empty string if every interest was "
+                "matched with real places."
+            )
+        },
+
         "days": {
             "type": "array",
             "description": "One entry per day of the trip, in visiting order.",
@@ -234,8 +166,6 @@ DAY_BY_DAY_ITINERARY_SCHEMA = {
                         "type": "string",
                         "description": "Short label for the day, e.g. 'Old Town & Viewpoints'."
                     },
-
-                    # --- Stop-level fields: one array entry PER PLACE visited that day ---
                     "stops": {
                         "type": "array",
                         "items": {
@@ -261,12 +191,6 @@ DAY_BY_DAY_ITINERARY_SCHEMA = {
                                         "fee, typical meal cost, etc). Use 0 for free stops."
                                     )
                                 },
-                                # This field uses a TYPE UNION (["integer", "null"])
-                                # instead of being left optional, because strict
-                                # mode requires every property to be in "required".
-                                # A union with null is how you say "this value is
-                                # sometimes legitimately absent" while still
-                                # satisfying that rule.
                                 "walking_minutes_from_previous_stop": {
                                     "type": ["integer", "null"],
                                     "description": (
@@ -294,6 +218,7 @@ DAY_BY_DAY_ITINERARY_SCHEMA = {
     },
     "required": [
         "destination_name", "number_of_days", "number_of_people",
-        "total_estimated_cost_usd", "budget_summary", "days"
+        "total_estimated_cost_usd", "budget_summary",
+        "unmatched_interests_note", "days"
     ]
 }

@@ -1,6 +1,5 @@
 """
 agent.py — The real tool-calling agent loop, using OpenAI's Responses API.
-
   PHASE 1 — THE TOOL-CALLING LOOP (may run several rounds):
     1. Start a conversation: [system message, user message]
     2. Ask the model to respond, giving it the list of tools it's allowed
@@ -26,31 +25,18 @@ from openai import OpenAI
 from schema import DAY_BY_DAY_ITINERARY_SCHEMA, TRIP_PLANNING_TOOLS
 from tools import geocode_destination, search_points_of_interest, get_walking_time_matrix
 
-# OpenAI() reads the OPENAI_API_KEY environment variable automatically —
-# no need to pass it explicitly. 
 openai_client = OpenAI()
 
-MODEL_NAME = "gpt-5"
+MODEL_NAME = "gpt-4.1"  # match whatever model string your OpenAI account has access to
 
-# A safety valve: if the model somehow gets stuck calling tools over and
-# over without ever producing a final answer (e.g. it keeps re-requesting
-# the same data), this stops the loop from running forever and burning
-# API credits. 8 rounds is generous for a 3-tool pipeline — a well-behaved
-# run typically finishes in 3-4 rounds (one per tool call, plus the final
-# no-tool-call round).
 MAX_TOOL_CALL_ROUNDS = 8
 
 
-# ---------------------------------------------------------------------------
-# SYSTEM_PROMPT — this is the ONLY place that tells the model which tools
-# exist, what order to use them in, and what the final answer needs to
-# contain. 
-# ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """\
 ROLE
-You are TripMate, an expert trip-planning assistant. You think like \
-a well-traveled friend who knows how to build a realistic, walkable \
-itinerary not a generic list of tourist highlights.
+You are TripMate, an expert local trip-planning assistant. You think like \
+a well-traveled local friend who knows how to build a realistic, walkable \
+itinerary — not a generic list of tourist highlights.
 
 TASK
 Build a complete day-by-day itinerary for the traveler's trip. You have \
@@ -60,7 +46,9 @@ three tools available and must use them in this order:
      get its coordinates.
   2. search_points_of_interest — call this next with the coordinates from
      step 1 and the traveler's interests, to get a pool of real candidate
-     places. Use max_results=30.
+     places. Use max_results=30. The result includes results_per_interest,
+     showing how many places were found for EACH interest separately —
+     read this carefully (see UNMATCHED INTERESTS below).
   3. get_walking_time_matrix — after reviewing the candidate pool, decide
      which places you're actually considering for the itinerary (enough
      to fill the requested trip length at the requested pace), and call
@@ -83,8 +71,35 @@ every single stop in every day:
     stop of the day" for the first one)
   - one short sentence on why it's included at that point in the day
 Also include: the destination name, number of days, number of people,
-total estimated cost in USD for the whole trip, and a short budget summary
-sentence.
+total estimated cost in USD for the whole trip, a short budget summary
+sentence, and a note about any unmatched interests (see below — say
+explicitly "none" if every interest was matched).
+
+UNMATCHED INTERESTS
+search_points_of_interest's results_per_interest tells you exactly how
+many real places were found for each interest term. If any interest
+found ZERO results, that is not an error and not something to hide —
+it genuinely means that interest isn't available at this destination
+(e.g. "beaches" at a landlocked city). In that case:
+  - Do NOT invent fake places to fill the gap.
+  - Do NOT silently drop the interest without mentioning it.
+  - DO state plainly, by name, which interest(s) had no results and why
+    if it's obvious (e.g. the destination is landlocked), in your final
+    answer's budget/notes section — this becomes unmatched_interests_note.
+  - DO build the itinerary around the traveler's OTHER interests plus
+    general highlights from the pool, so the trip is still complete and
+    useful despite the one gap.
+If every interest found at least one real result, explicitly say so
+("unmatched interests: none") rather than leaving this unaddressed.
+
+ONE-SHOT CONSTRAINT — NO CLARIFYING QUESTIONS
+This is a one-shot planning request. There is no opportunity to ask the
+traveler a follow-up question and get a reply — if you write a question
+instead of an itinerary, no one will ever see it or answer it, and the
+app will fail. If a destination or its geocoded location seems ambiguous
+or uncertain, proceed with your single best reasonable interpretation
+and note the assumption in your final answer. NEVER leave the day-by-day
+plan empty or incomplete in order to ask something first.
 
 CONSTRAINTS
 - Only include places that came from search_points_of_interest. Never
@@ -100,7 +115,6 @@ CONSTRAINTS
   trade-off in your budget summary. If no budget is given, still estimate
   costs honestly and say so.
 """
-
 
 def run_tool(tool_name: str, arguments: dict):
     """

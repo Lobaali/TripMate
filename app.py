@@ -17,6 +17,7 @@ friendly message instead of ~15 seconds later with a raw error.
 """
 
 import os
+import re
 import time
 import requests
 import streamlit as st
@@ -29,6 +30,21 @@ load_dotenv()
 GEOAPIFY_KEY = st.secrets["GEOAPIFY_KEY"]  # https://myprojects.geoapify.com (free tier: 3000 req/day)
 
 st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="centered")
+
+
+# ---------------------------------------------------------------------------
+# English-only input check. Allows plain Latin letters, digits, spaces, and
+# the punctuation actually needed for place names (comma, period,
+# apostrophe, hyphen) — rejects other scripts (Arabic, Chinese, Cyrillic,
+# emoji, etc). This deliberately also rejects purely-accented names like
+# "México" or "Zürich" — a simplification, not a claim that those aren't
+# valid places, just a literal "English characters only" rule as requested.
+# ---------------------------------------------------------------------------
+ENGLISH_ONLY_PATTERN = re.compile(r"^[A-Za-z0-9\s,.'\-]*$")
+
+
+def is_english_only(text: str) -> bool:
+    return bool(ENGLISH_ONLY_PATTERN.match(text))
 
 
 def check_destination(destination_name: str, max_retries: int = 2):
@@ -46,6 +62,15 @@ def check_destination(destination_name: str, max_retries: int = 2):
     rate-limits per API KEY instead of per IP, sidestepping the shared-IP
     problem entirely.
 
+    ALSO CHECKS CONFIDENCE, NOT JUST "DID IT FIND ANYTHING": Geoapify's
+    fuzzy matching can match a short/garbled string to something real but
+    wrong — e.g. "riyd" once matched a location in Morocco instead of
+    Riyadh. "Found a match" and "found the RIGHT match" aren't the same
+    thing. Geoapify returns properties.rank.confidence (0.0-1.0) per
+    result; anything below CONFIDENCE_THRESHOLD is treated as "invalid"
+    rather than blindly trusted, so ambiguous input gets rejected here
+    instead of confusing the agent later.
+
     Caches CONFIRMED results ("valid"/"invalid") in st.session_state for
     the rest of the session, so repeat tests of the same typed destination
     don't burn another API call. Deliberately does NOT cache "unknown" —
@@ -53,12 +78,15 @@ def check_destination(destination_name: str, max_retries: int = 2):
 
     Returns:
         (status, detail) where status is one of:
-            "valid"   — a real match was found.
-            "invalid" — the API reached us fine and found nothing.
+            "valid"   — a real match was found, above the confidence bar.
+            "invalid" — the API reached us fine and found nothing usable
+                        (either no results, or only low-confidence ones).
             "unknown" — couldn't get a real answer after retrying.
         detail is None for "valid"/"invalid", or a short diagnostic
         string for "unknown".
     """
+    CONFIDENCE_THRESHOLD = 0.5
+
     if "destination_check_cache" not in st.session_state:
         st.session_state.destination_check_cache = {}
     cached = st.session_state.destination_check_cache.get(destination_name)
@@ -76,7 +104,13 @@ def check_destination(destination_name: str, max_retries: int = 2):
             )
             response.raise_for_status()
             features = response.json().get("features", [])
-            result = "valid" if features else "invalid"
+
+            if not features:
+                result = "invalid"
+            else:
+                confidence = features[0].get("properties", {}).get("rank", {}).get("confidence", 0)
+                result = "valid" if confidence >= CONFIDENCE_THRESHOLD else "invalid"
+
             st.session_state.destination_check_cache[destination_name] = result
             return result, None
         except requests.exceptions.HTTPError as e:
@@ -175,9 +209,13 @@ with st.sidebar:
     total_budget_usd = st.number_input("💰 Total budget in USD (0 = no limit)", min_value=0, value=0, step=50)
     st.divider()
 
-    can_generate = bool(destination_name.strip()) and bool(checked_interests)
-    if not can_generate:
+    destination_is_english = is_english_only(destination_name)
+
+    can_generate = bool(destination_name.strip()) and bool(checked_interests) and destination_is_english
+    if not destination_name.strip() or not checked_interests:
         st.caption("⚠️ Pick a destination and at least one interest to continue.")
+    elif not destination_is_english:
+        st.caption("⚠️ Please type the destination using English letters only.")
     generate_button_clicked = st.button(
         "Generate itinerary", type="primary", use_container_width=True, disabled=not can_generate
     )
@@ -190,8 +228,8 @@ if generate_button_clicked:
 
     if validation_result == "invalid":
         st.error(
-            f"⚠️ Couldn't find **\"{destination_name}\"** as a real place. "
-            "Check the spelling, or try a broader name (e.g. 'Porto' instead of a specific street)."
+            f"⚠️ Couldn't confidently match **\"{destination_name}\"** to a real place. "
+            "Please rewrite the destination and check the spelling, then try again."
         )
         st.stop()
     elif validation_result == "unknown":
@@ -231,6 +269,21 @@ if generate_button_clicked:
                 st.code(str(e))
             st.stop()
 
+    # DEFENSIVE CHECK: strict structured output guarantees the SHAPE of
+    # itinerary["days"] (a list), but not that it's non-empty. If the
+    # agent got confused mid-way (e.g. an ambiguous geocode result led it
+    # to want to ask a clarifying question instead of committing to a
+    # plan), it can still produce a schema-valid but EMPTY days list —
+    # which crashes st.tabs([]) since Streamlit requires at least one tab
+    # label. Catch that here with a clear message instead of a traceback.
+    if not itinerary.get("days"):
+        st.warning(
+            "⚠️ The agent couldn't confidently build a full itinerary for this destination — "
+            "it may be too ambiguous or obscure. Try being more specific "
+            "(e.g. 'Riyadh, Saudi Arabia' instead of a short abbreviation)."
+        )
+        st.stop()
+
     st.header(f"{itinerary['destination_name']} · {itinerary['number_of_days']} days")
 
     stat_col1, stat_col2, stat_col3 = st.columns(3)
@@ -238,6 +291,13 @@ if generate_button_clicked:
     stat_col2.metric("💵 Estimated cost", f"${itinerary['total_estimated_cost_usd']:.0f}")
     stat_col3.metric("🏃 Pace", pace.capitalize())
     st.info(f"💡 {itinerary['budget_summary']}")
+
+    # Show which interests (if any) had no real matches at this
+    # destination — e.g. "beaches" at a landlocked city. The agent is
+    # instructed to fill this with an honest explanation, or leave it
+    # empty when every interest was matched.
+    if itinerary.get("unmatched_interests_note"):
+        st.warning(f"🔍 {itinerary['unmatched_interests_note']}")
 
     st.divider()
 
