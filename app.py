@@ -26,7 +26,7 @@ from agent import run_trip_planning_agent
 
 load_dotenv()
 
-GEOAPIFY_KEY = os.environ["GEOAPIFY_KEY"]  # https://myprojects.geoapify.com (free tier: 3000 req/day)
+GEOAPIFY_KEY = st.secrets["GEOAPIFY_KEY"]  # https://myprojects.geoapify.com (free tier: 3000 req/day)
 
 st.set_page_config(page_title="TripMate", page_icon="🗺️", layout="centered")
 
