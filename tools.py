@@ -2,7 +2,9 @@
 tools.py — The three real-world API calls the agent can use as "tools".
 
 WHAT THIS FILE IS: plain Python functions that hit real APIs and return
-plain Python data (tuples, lists, dicts). 
+plain Python data (tuples, lists, dicts). Nothing in this file talks to
+OpenAI or knows anything about "agents" or "tool calls" — it's just three
+ordinary functions that happen to be USED as tools by agent.py.
 
 THE THREE FUNCTIONS, IN THE ORDER THE AGENT TYPICALLY CALLS THEM:
   1. geocode_destination()        -> turn a place name into coordinates
@@ -17,26 +19,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-SERPAPI_KEY = os.environ["SERPAPI_KEY"]  # https://serpapi.com/manage-api-key (free tier: 100 searches/month)
-ORS_KEY = os.environ["ORS_KEY"]          # https://openrouteservice.org/dev/#/signup (free tier: 2000 req/day)
+GEOAPIFY_KEY = os.environ["GEOAPIFY_KEY"]  # https://myprojects.geoapify.com (free tier: 3000 req/day)
+SERPAPI_KEY = os.environ["SERPAPI_KEY"]    # https://serpapi.com/manage-api-key (free tier: 100 searches/month)
+ORS_KEY = os.environ["ORS_KEY"]            # https://openrouteservice.org/dev/#/signup (free tier: 2000 req/day)
 
 
-def geocode_destination(destination_name: str, max_retries: int = 3):
+
+def geocode_destination(destination_name: str, max_retries: int = 2):
     """
     Turn a place name like 'Lisbon, Portugal' into (latitude, longitude).
 
-    WHY NOMINATIM: it's OpenStreetMap's free geocoding service — no API key
-    needed at all. The tradeoff is a strict rate limit (~1 request/second)
-    and, since apps hosted on Streamlit Cloud share outbound IPs across
-    many unrelated apps, it's easy to get a 429 "Too many requests" even
-    if THIS app is behaving well — someone else's app sharing the same IP
-    might be hammering Nominatim at the same moment.
+    USES GEOAPIFY, NOT NOMINATIM. Nominatim rate-limits per SOURCE IP
+    (~1 request/second), and Streamlit Community Cloud apps share a small,
+    published pool of outbound IPs across the ENTIRE platform — every app
+    hosted there, from every user, not just this one. Confirmed directly
+    from Nominatim's own response body: a real 429 "Too many requests"
+    persisted for over an hour of testing, and failed even on correctly-
+    spelled, real destinations — not just typos. That ruled out "transient
+    rate limit" as the explanation; it's ongoing saturation baked into
+    using a free, IP-limited service from a heavily-shared hosting IP.
 
-    WHY THE RETRY LOOP: a single 429 is usually transient, not a sign
-    anything is actually broken. Retrying with a short, increasing delay
-    (1s, then 2s) resolves the large majority of these without the user
-    ever seeing an error. If all retries are exhausted, the 429 is raised
-    normally so app.py's error handling can show a friendly message.
+    Geoapify rate-limits per API KEY instead of per IP, so this app's
+    usage is no longer entangled with unrelated traffic from every other
+    app on the platform.
 
     Args:
         destination_name: free text like "Lisbon, Portugal" or just "Lisbon"
@@ -46,46 +51,38 @@ def geocode_destination(destination_name: str, max_retries: int = 3):
         A tuple (latitude, longitude), both as plain Python floats.
 
     Raises:
-        ValueError if Nominatim genuinely found nothing for this name.
-        requests.exceptions.HTTPError if every retry still gets rate-limited
-        (or another HTTP error) after max_retries attempts.
+        ValueError if Geoapify genuinely found nothing for this name.
+        requests.exceptions.HTTPError if every retry still fails.
     """
     last_error = None
 
     for attempt in range(1, max_retries + 1):
         try:
             response = requests.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": destination_name, "format": "json", "limit": 1},
-                headers={"User-Agent": "TripMate/1.0"},
+                "https://api.geoapify.com/v1/geocode/search",
+                params={"text": destination_name, "limit": 1, "apiKey": GEOAPIFY_KEY},
                 timeout=10,
             )
             response.raise_for_status()
 
-            results = response.json()
-            if not results:
-                # Genuinely no match — retrying won't help, fail immediately
-                # with a clear message instead of burning retries on it.
+            features = response.json().get("features", [])
+            if not features:
                 raise ValueError(f"Could not geocode '{destination_name}' — check the spelling or try a broader name.")
 
-            latitude = float(results[0]["lat"])
-            longitude = float(results[0]["lon"])
-            return latitude, longitude
+            # Geoapify returns coordinates as [longitude, latitude] in
+            # geometry.coordinates (standard GeoJSON order) — the reverse
+            # of how we normally say "latitude, longitude" out loud.
+            longitude, latitude = features[0]["geometry"]["coordinates"]
+            return float(latitude), float(longitude)
 
         except requests.exceptions.HTTPError as e:
             last_error = e
             is_rate_limited = e.response is not None and e.response.status_code == 429
             if is_rate_limited and attempt < max_retries:
-                # Backoff: wait a bit longer each retry (1s, 2s, ...) rather
-                # than hammering Nominatim again immediately, which would
-                # just trigger the same 429 right back.
                 time.sleep(attempt)
                 continue
-            raise  # not a 429, or we're out of retries — surface it for real
+            raise
 
-    # Should be unreachable (the loop always returns or raises), but keeps
-    # the function's control flow explicit rather than implicitly falling
-    # through to `None`.
     raise last_error
 
 
