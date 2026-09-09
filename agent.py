@@ -1,22 +1,5 @@
 """
 agent.py — The real tool-calling agent loop, using OpenAI's Responses API.
-  PHASE 1 — THE TOOL-CALLING LOOP (may run several rounds):
-    1. Start a conversation: [system message, user message]
-    2. Ask the model to respond, giving it the list of tools it's allowed
-       to call (client.responses.create(..., tools=TOOLS))
-    3. Add the model's response to the conversation history
-    4. Check: did the model ask to call any tools this round?
-         - YES -> actually run those Python functions for real, add their
-                  results to the conversation as new messages, and go
-                  back to step 2 (the model gets another turn, now with
-                  real data available)
-         - NO  -> the model has decided it's done reasoning and has
-                  written its final plain-text answer — stop looping
-
-  PHASE 2 — STRUCTURED OUTPUT (a separate, single call):
-    5. Send the finished plain-text answer to the model ONE more time,
-       this time with NO tools available, and ask it to reformat that
-       text into strict JSON matching DAY_BY_DAY_ITINERARY_SCHEMA.
 """
 
 import json
@@ -76,20 +59,30 @@ sentence, and a note about any unmatched interests (see below — say
 explicitly "none" if every interest was matched).
 
 UNMATCHED INTERESTS
-search_points_of_interest's results_per_interest tells you exactly how
-many real places were found for each interest term. If any interest
-found ZERO results, that is not an error and not something to hide —
-it genuinely means that interest isn't available at this destination
-(e.g. "beaches" at a landlocked city). In that case:
+search_points_of_interest's results_per_interest tells you how many results \
+came back for each interest — but a result COMING BACK is not the same as \
+a result GENUINELY SATISFYING that interest. Apply real judgment to every \
+result before counting it as a match:
+  - A restaurant or venue with "beach" in its name is NOT a real beach.
+  - An indoor water park, amusement venue, or seafood restaurant is NOT
+    a real beach, even if it surfaced in a "beaches" search.
+  - A business whose connection to the interest is only in its name or
+    marketing, not its actual nature, does not genuinely satisfy that
+    interest.
+If, after this critical review, ZERO results genuinely satisfy an \
+interest — even if the raw search technically returned some loosely-named \
+matches — treat that interest as unmatched. In that case:
   - Do NOT invent fake places to fill the gap.
-  - Do NOT silently drop the interest without mentioning it.
-  - DO state plainly, by name, which interest(s) had no results and why
-    if it's obvious (e.g. the destination is landlocked), in your final
-    answer's budget/notes section — this becomes unmatched_interests_note.
-  - DO build the itinerary around the traveler's OTHER interests plus
-    general highlights from the pool, so the trip is still complete and
-    useful despite the one gap.
-If every interest found at least one real result, explicitly say so
+  - Do NOT include the loosely-matching results just because something \
+    came back, and do NOT silently drop the interest without mentioning it.
+  - DO state plainly, by name, which interest(s) had no genuine matches, \
+    and briefly why if it's obvious (e.g. the destination is landlocked, \
+    so "beach" results were only themed restaurants, not real beaches), \
+    in unmatched_interests_note.
+  - DO build the itinerary around the traveler's OTHER interests plus \
+    general highlights from genuinely relevant places, so the trip is \
+    still complete and useful despite the one gap.
+If every interest found at least one genuine result, explicitly say so \
 ("unmatched interests: none") rather than leaving this unaddressed.
 
 ONE-SHOT CONSTRAINT — NO CLARIFYING QUESTIONS
@@ -116,44 +109,30 @@ CONSTRAINTS
   costs honestly and say so.
 """
 
+
 def run_tool(tool_name: str, arguments: dict):
     """
-    WHAT THIS DOES: takes the name and arguments the MODEL chose (parsed
-    from its tool-call request) and routes them to the matching real
-    Python function in tools.py. This is the one place in the whole
-    system where a "tool call" (which is really just a JSON object the
-    model generated) turns into an actual HTTP request to a real API.
-
-    WHY WRAP THE RETURN VALUES: tools.py's functions return whatever shape
-    is most natural in Python (e.g. geocode_destination returns a plain
-    tuple). But everything sent back to the model has to be a
-    JSON-serializable object, so each branch below wraps the raw return
-    value into a small dict with clear key names before handing it back.
-
-    Args:
-        tool_name: the function name the model asked to call, e.g.
-                   "geocode_destination" — must match one of the "name"
-                   values in schema.py's TRIP_PLANNING_TOOLS.
-        arguments: a dict of the arguments the model supplied, already
-                   parsed from the tool call's JSON string by the caller.
-
-    Returns:
-        A JSON-serializable dict with the tool's result, ready to be sent
-        back to the model as a function_call_output message.
+    Tool dispatcher — routes the model's tool-call requests to the real
+    Python functions in tools.py, and returns a JSON-serializable result.
     """
     if tool_name == "geocode_destination":
         latitude, longitude = geocode_destination(**arguments)
         return {"latitude": latitude, "longitude": longitude}
 
     if tool_name == "search_points_of_interest":
-        found_places = search_points_of_interest(**arguments)
-        return {"places": found_places}
+        # tools.py's search_points_of_interest() now returns the full
+        # {"places": [...], "results_per_interest": {...}} dict itself —
+        # pass it straight through rather than re-wrapping it in another
+        # "places" key (that would double-nest it as {"places": {"places":
+        # [...], "results_per_interest": {...}}}, which is wrong).
+        return search_points_of_interest(**arguments)
 
     if tool_name == "get_walking_time_matrix":
         matrix_seconds = get_walking_time_matrix(**arguments)
         return {"walking_time_matrix_seconds": matrix_seconds}
 
     return {"error": "unknown_tool", "tool_name": tool_name}
+
 
 
 def run_trip_planning_agent(

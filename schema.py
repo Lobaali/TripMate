@@ -39,10 +39,14 @@ TRIP_PLANNING_TOOLS = [
             "own interests as the search terms. Call this after geocode_destination, "
             "using the coordinates it returned. Use max_results=30 unless you have "
             "a specific reason not to. The result tells you, per interest, how many "
-            "places were found — if an interest found ZERO places, that interest is "
-            "simply not available at this destination; do not treat that as an error, "
-            "note it honestly in unmatched_interests_note, and build the itinerary "
-            "around the traveler's other interests plus general highlights instead."
+            "places were found — but a place matching the search TEXT is not the same "
+            "as it genuinely satisfying that interest (e.g. a restaurant named 'Beach "
+            "___' is not a real beach). Critically judge each result before treating "
+            "it as a real match. If, after that judgment, an interest has zero genuine "
+            "matches, it's simply not available at this destination; do not treat that "
+            "as an error, note it honestly in unmatched_interests_note, and build the "
+            "itinerary around the traveler's other interests plus general highlights "
+            "instead."
         ),
         "parameters": {
             "type": "object",
