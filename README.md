@@ -100,6 +100,7 @@ pip install -r requirements.txt
 | Key | Where to get it | Free tier |
 |---|---|---|
 | `OPENAI_API_KEY` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) | Pay-per-token, but pennies per itinerary |
+| `GEOAPIFY_KEY` | [myprojects.geoapify.com](https://myprojects.geoapify.com) | 3,000 requests/day |
 | `SERPAPI_KEY` | [serpapi.com/manage-api-key](https://serpapi.com/manage-api-key) | 100 searches/month |
 | `ORS_KEY` | [openrouteservice.org/dev/#/signup](https://openrouteservice.org/dev/#/signup) | 2,000 requests/day |
 
