@@ -17,7 +17,7 @@ PHASE 1 — the tool-calling loop (runs until the model is done reasoning)
 │  You describe the trip → model decides what to do next          │
 │                                                                 │
 │  Model asks to call:  geocode_destination                       │
-│       → Python actually calls Nominatim, sends back coordinates │
+│       → Python actually calls geoapify, sends back coordinates │
 │                                                                 │
 │  Model asks to call:  search_points_of_interest                 │
 │       → Python actually calls SerpApi, sends back real places   │
@@ -49,7 +49,7 @@ PHASE 2 — structured output (one separate, final call, no tools)
 |---|---|
 | **`app.py`** | The Streamlit UI. Collects your inputs in the sidebar, calls `run_trip_planning_agent()`, and renders whatever itinerary comes back. Has no planning logic of its own and never calls the tools directly. |
 | **`agent.py`** | The actual agent: the tool-calling loop (Phase 1) plus the structured-output conversion call (Phase 2). |
-| **`tools.py`** | The three real functions the agent can call: `geocode_destination()` (Nominatim, free), `search_points_of_interest()` (SerpApi/Google Maps), `get_walking_time_matrix()` (OpenRouteService).|
+| **`tools.py`** | The three real functions the agent can call: `geocode_destination()` (geoapify), `search_points_of_interest()` (SerpApi/Google Maps), `get_walking_time_matrix()` (OpenRouteService).|
 | **`schema.py`** | Two things: `TRIP_PLANNING_TOOLS` (the flat tool definitions the model sees during Phase 1) and `DAY_BY_DAY_ITINERARY_SCHEMA` (the raw JSON schema the final answer must match, used only in Phase 2). |
 | **`requirements.txt`** | The Python packages the project needs (`streamlit`, `requests`, `openai`, `python-dotenv`). |
 | **`.env.example`** | A template showing which environment variables (API keys) you need. Copy it to a real `.env` and fill in your own keys|
@@ -113,6 +113,7 @@ Open `.env` and paste your three real keys in, one per line, no quotes:
 OPENAI_API_KEY=sk-...
 SERPAPI_KEY=...
 ORS_KEY=...
+GEOAPIFY_KEY=...
 ```
 
 ### 8. Check your model name
